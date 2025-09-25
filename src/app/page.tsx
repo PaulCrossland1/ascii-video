@@ -31,15 +31,15 @@ const STRIPE_PAYMENT_LINK =
 
 const FREE_EXPORT_CONFIG = {
   fps: 10,
-  minCharPixel: 8,
-  maxCharPixel: 12,
+  minCharPixel: 4,
+  maxCharPixel: 10,
   watermark: "create your ascii video at https://ascii.video",
 } as const;
 
 const PREMIUM_EXPORT_CONFIG = {
   fps: 24,
-  minCharPixel: 6,
-  maxCharPixel: 12,
+  minCharPixel: 4,
+  maxCharPixel: 10,
   watermark: null as string | null,
 } as const;
 
@@ -188,16 +188,25 @@ function frameToHtml(frame: AsciiFrame) {
 
 async function canvasToUint8Array(canvas: HTMLCanvasElement): Promise<Uint8Array> {
   return new Promise((resolve, reject) => {
+    console.log(`Converting canvas to PNG: ${canvas.width}x${canvas.height}`);
+
     canvas.toBlob(
       async (blob) => {
         if (!blob) {
-          reject(new Error("Failed to convert canvas to blob"));
+          console.error("Canvas toBlob returned null - canvas may be empty or corrupted");
+          reject(new Error("Failed to convert canvas to blob - canvas content may be invalid"));
           return;
         }
+
+        console.log(`Canvas blob created: ${blob.size} bytes`);
+
         try {
           const arrayBuffer = await blob.arrayBuffer();
-          resolve(new Uint8Array(arrayBuffer));
+          const uint8Array = new Uint8Array(arrayBuffer);
+          console.log(`Canvas converted to Uint8Array: ${uint8Array.length} bytes`);
+          resolve(uint8Array);
         } catch (error) {
+          console.error("Failed to convert blob to array buffer:", error);
           reject(error);
         }
       },
@@ -265,8 +274,9 @@ async function ensureFfmpeg(ffmpegRef: MutableRefObject<FFmpeg | null>) {
 
   try {
     const ffmpeg = new FFmpeg();
-    ffmpeg.on("log", ({ message }) => {
-      console.log("FFmpeg:", message);
+    ffmpeg.on("log", ({ type, message }) => {
+      const logLevel = type === 'error' ? 'error' : 'log';
+      console[logLevel](`FFmpeg [${type}]:`, message);
     });
 
     await ffmpeg.load();
@@ -291,7 +301,7 @@ export default function Home() {
   const { user, entitlement, signOut, loadingSession, loadingProfile } = useAuth();
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [charsetId, setCharsetId] = useState<CharsetId>(CHARACTER_PRESETS[0].value);
-  const [charPixelSize, setCharPixelSize] = useState(10);
+  const [charPixelSize, setCharPixelSize] = useState(6);
   const [contrast, setContrast] = useState(1);
   const [isPlaying, setIsPlaying] = useState(true);
   const [colorScheme, setColorScheme] = useState<ColorSchemeId>(COLOR_SCHEMES[0].value);
@@ -345,7 +355,14 @@ export default function Home() {
   const isAuthLoading = loadingSession || loadingProfile;
   const isFreeTier = entitlement !== "premium";
 
-  const previewFontSize = charPixelSize;
+  // Preview uses fixed HD-like sizing independent of export character size
+  const PREVIEW_TARGET_HEIGHT = 540; // Fixed preview height for consistent UI
+  const previewFontSize = useMemo(() => {
+    if (!frameMetrics.height) return 10;
+    // Calculate font size to fit target height
+    return Math.max(8, Math.min(16, Math.floor(PREVIEW_TARGET_HEIGHT / frameMetrics.height * 1.2)));
+  }, [frameMetrics.height]);
+
   const previewLineHeight = previewFontSize * 1.18;
   const previewTextStyle = useMemo(
     () => ({
@@ -357,12 +374,12 @@ export default function Home() {
     [previewFontSize, previewLineHeight],
   );
 
-  const previewWidth = useMemo(() => VIEWPORT_HEIGHT * videoAspect, [videoAspect]);
+  const previewWidth = useMemo(() => PREVIEW_TARGET_HEIGHT * videoAspect, [videoAspect]);
 
   const previewContainerStyle = useMemo(
     () => ({
       width: `${previewWidth}px`,
-      height: `${VIEWPORT_HEIGHT}px`,
+      height: `${PREVIEW_TARGET_HEIGHT}px`,
     }),
     [previewWidth],
   );
@@ -700,21 +717,13 @@ export default function Home() {
 
       const fps = tierConfig.fps;
 
-      // Limit max frames for faster processing on long videos
-      const maxFrames = isFreeTier ? 300 : 600; // 30s@10fps / 25s@24fps
-      const idealFrames = Math.ceil(duration * fps);
-      totalFrames = Math.min(idealFrames, maxFrames);
+      // Calculate frames needed for full video duration
+      totalFrames = Math.ceil(duration * fps);
 
-      const step = totalFrames > 1 ? duration / (totalFrames - 1) : 0;
+      // Calculate step to avoid sampling the very end frame (which causes pause)
+      const step = totalFrames > 1 ? duration / totalFrames : 0;
 
-      if (idealFrames > totalFrames) {
-        setExportState({
-          status: "sampling",
-          format,
-          progress: 0.1,
-          message: `Video truncated to ${totalFrames} frames for faster processing`
-        });
-      }
+      console.log(`Processing ${duration.toFixed(1)}s video: ${totalFrames} frames at ${fps}fps`);
 
       const bufferCanvas = document.createElement("canvas");
       const exportCanvas = exportCanvasRef.current ?? document.createElement("canvas");
@@ -724,14 +733,37 @@ export default function Home() {
         throw new Error("Canvas context unavailable");
       }
 
+      // Progress tracking
+      const startTime = Date.now();
+      let frameIndex = 0;
+      const FRAME_GENERATION_WEIGHT = 0.8; // 80% of total work
+      const ENCODING_WEIGHT = 0.15; // 15% of total work
+      const DELIVERY_WEIGHT = 0.05; // 5% of total work
+
       for (let index = 0; index < totalFrames; index++) {
         const targetTime = clampTime(duration, step === 0 ? 0 : index * step);
+
+        // Retry seek operation with fallback
+        let seekSucceeded = false;
         try {
           await seekVideo(samplingVideo, targetTime);
+          seekSucceeded = true;
         } catch (error) {
-          console.warn("frame seek failed", error);
+          console.warn(`frame seek failed for time ${targetTime}:`, error);
+          // Try fallback to current time
+          try {
+            samplingVideo.currentTime = targetTime;
+            seekSucceeded = true;
+          } catch (fallbackError) {
+            console.error(`fallback seek also failed:`, fallbackError);
+          }
+        }
+
+        if (!seekSucceeded) {
+          console.warn(`skipping frame ${index} due to seek failure`);
           continue;
         }
+
         const frame = asciiFromVideo(
           samplingVideo,
           bufferCanvas,
@@ -740,16 +772,42 @@ export default function Home() {
           charPixelRef.current,
           contrastRef.current,
         );
-        if (!frame) continue;
 
-        const fontSize = Math.min(12, Math.max(tierConfig.minCharPixel, charPixelRef.current));
-        const cellHeight = fontSize * 1.2;
-        const cellWidth = fontSize * 0.62;
-        exportCanvas.width = Math.floor(frame.width * cellWidth);
-        exportCanvas.height = Math.floor(frame.height * cellHeight);
+        if (!frame) {
+          console.warn(`ASCII conversion failed for frame ${index}`);
+          continue;
+        }
+
+        // Calculate HD output dimensions
+        const TARGET_HD_HEIGHT = 720; // 720p HD standard
+        const videoAspect = samplingVideo.videoWidth && samplingVideo.videoHeight ? samplingVideo.videoWidth / samplingVideo.videoHeight : DEFAULT_ASPECT;
+        const TARGET_HD_WIDTH = Math.round(TARGET_HD_HEIGHT * videoAspect);
+
+        // Scale font size to achieve HD resolution while maintaining character density
+        const baseFontSize = Math.min(12, Math.max(tierConfig.minCharPixel, charPixelRef.current));
+        const scaleFactor = TARGET_HD_HEIGHT / (frame.height * baseFontSize * 1.2);
+        const hdFontSize = Math.max(8, Math.round(baseFontSize * scaleFactor));
+
+        const cellHeight = hdFontSize * 1.2;
+        const cellWidth = hdFontSize * 0.62;
+
+        // Calculate final dimensions and ensure they're even for H.264
+        const targetWidth = Math.floor(frame.width * cellWidth / 2) * 2;
+        const targetHeight = Math.floor(frame.height * cellHeight / 2) * 2;
+
+        exportCanvas.width = targetWidth;
+        exportCanvas.height = targetHeight;
+
+        console.log(`HD Canvas: ${exportCanvas.width}x${exportCanvas.height} (${hdFontSize}px font, ${scaleFactor.toFixed(2)}x scale) • Grid: ${frame.width}x${frame.height}`);
+
+        if (exportCanvas.width === 0 || exportCanvas.height === 0) {
+          console.error(`Invalid canvas dimensions: ${exportCanvas.width}x${exportCanvas.height}`);
+          continue;
+        }
+
         exportContext.fillStyle = "#000000";
         exportContext.fillRect(0, 0, exportCanvas.width, exportCanvas.height);
-        const asciiFont = `${fontSize}px "Menlo", "Fira Code", monospace`;
+        const asciiFont = `${hdFontSize}px "Menlo", "Fira Code", monospace`;
         exportContext.font = asciiFont;
         exportContext.textBaseline = "top";
         exportContext.textAlign = "left";
@@ -773,47 +831,99 @@ export default function Home() {
         }
 
         // Draw all characters of the same color together
+        let totalCharsDrawn = 0;
         for (const [color, chars] of colorGroups) {
           exportContext.fillStyle = color;
           for (const {char, x, y} of chars) {
             exportContext.fillText(char, x, y);
+            totalCharsDrawn++;
           }
         }
+        console.log(`Drew ${totalCharsDrawn} characters in ${colorGroups.size} color groups`);
 
         if (tierConfig.watermark) {
-          exportContext.font = `${Math.max(12, Math.round(fontSize * 0.9))}px "Menlo", "Fira Code", monospace`;
+          const watermarkFontSize = Math.max(12, Math.round(hdFontSize * 0.8));
+          exportContext.font = `${watermarkFontSize}px "Menlo", "Fira Code", monospace`;
           exportContext.textAlign = "right";
           exportContext.textBaseline = "bottom";
           exportContext.fillStyle = "#ffffff";
-          exportContext.fillText(tierConfig.watermark, exportCanvas.width - 12, exportCanvas.height - 8);
+          const padding = Math.round(hdFontSize * 0.8);
+          exportContext.fillText(tierConfig.watermark, exportCanvas.width - padding, exportCanvas.height - padding);
           exportContext.textAlign = "left";
           exportContext.textBaseline = "top";
           exportContext.font = asciiFont;
         }
 
-        const frameName = `frame_${String(index).padStart(4, "0")}.png`;
+        // Use consecutive frame numbering for FFmpeg
+        const frameName = `frame_${String(frameIndex).padStart(4, "0")}.png`;
         try {
           const pngBytes = await canvasToUint8Array(exportCanvas);
-          await ffmpeg.writeFile(frameName, pngBytes);
+          // Create a fresh Uint8Array to avoid SharedArrayBuffer issues with FFmpeg.wasm
+          const cleanBytes = new Uint8Array(pngBytes.buffer.slice(pngBytes.byteOffset, pngBytes.byteOffset + pngBytes.byteLength));
+          await ffmpeg.writeFile(frameName, cleanBytes);
+
+          // Verify the file was written correctly
+          const verifyData = await ffmpeg.readFile(frameName);
+          const verifySize = verifyData instanceof Uint8Array ? verifyData.length : 0;
+          console.log(`Successfully wrote ${frameName}: original ${pngBytes.length} bytes, verified ${verifySize} bytes`);
+
+          if (verifySize === 0) {
+            throw new Error(`FFmpeg writeFile failed - ${frameName} is empty after write`);
+          }
         } catch (error) {
-          console.error(`Failed to process frame ${index}:`, error);
-          throw new Error(`Frame processing failed at frame ${index + 1}`);
+          console.error(`Failed to process frame ${frameIndex} (source ${index}):`, error);
+          throw new Error(`Frame processing failed at frame ${frameIndex + 1}`);
         }
+
+        frameIndex++; // Only increment when frame is successfully written
+
+        // Calculate progress and time estimates
+        const frameProgress = frameIndex / totalFrames;
+        const overallProgress = frameProgress * FRAME_GENERATION_WEIGHT;
+        const elapsed = (Date.now() - startTime) / 1000;
+        const frameRate = frameIndex / elapsed;
+        const remainingFrames = totalFrames - frameIndex;
+        const estimatedTimeLeft = remainingFrames > 0 && frameRate > 0 ? remainingFrames / frameRate : 0;
+
+        let message = `Rendering frame ${frameIndex}/${totalFrames}`;
+        if (frameIndex > 10) { // Only show estimates after a few frames for accuracy
+          message += ` • ${frameRate.toFixed(1)} fps • ${estimatedTimeLeft.toFixed(0)}s remaining`;
+        }
+
         setExportState({
           status: "sampling",
           format,
-          progress: 0.1 + (index / totalFrames) * 0.5,
-          message: `Captured frame ${index + 1} / ${totalFrames}`,
+          progress: overallProgress,
+          message,
         });
       }
+
+      // Update totalFrames to actual frames written
+      totalFrames = frameIndex;
 
       samplingVideo.pause();
       samplingVideo.src = "";
 
       if (totalFrames === 0) {
-        throw new Error("No frames captured for export");
+        throw new Error("No frames captured for export - check video seeking and ASCII conversion");
       }
 
+      console.log(`Frame generation complete: ${totalFrames} frames written`);
+
+      // Verify frames exist in FFmpeg filesystem before encoding
+      try {
+        const firstFrame = await ffmpeg.readFile("frame_0000.png");
+        console.log(`First frame size: ${firstFrame instanceof Uint8Array ? firstFrame.length : 'unknown'} bytes`);
+        if (totalFrames > 1) {
+          const lastFrame = await ffmpeg.readFile(`frame_${String(totalFrames - 1).padStart(4, "0")}.png`);
+          console.log(`Last frame size: ${lastFrame instanceof Uint8Array ? lastFrame.length : 'unknown'} bytes`);
+        }
+      } catch (error) {
+        console.error("Frame verification failed:", error);
+        throw new Error("Generated frames are not accessible in FFmpeg filesystem");
+      }
+
+      console.log(`Starting encoding with ${totalFrames} frames`);
       outputName = OUTPUT_NAME[format];
       const args = ["-framerate", `${fps}`, "-i", "frame_%04d.png"];
       if (format === "gif") {
@@ -824,13 +934,52 @@ export default function Home() {
         args.push("-c:v", "libx264", "-pix_fmt", "yuv420p", outputName);
       }
 
-      setExportState({ status: "encoding", format, progress: 0.7, message: "Encoding media" });
-      await ffmpeg.exec(args);
+      console.log(`FFmpeg command: ${args.join(' ')}`);
+      const encodingStart = Date.now();
+      const encodingProgress = FRAME_GENERATION_WEIGHT;
+      setExportState({
+        status: "encoding",
+        format,
+        progress: encodingProgress,
+        message: `Encoding ${totalFrames} frames to ${format.toUpperCase()}...`
+      });
 
-      setExportState({ status: "delivering", format, progress: 0.9, message: "Preparing download" });
+      try {
+        await ffmpeg.exec(args);
+        const encodingTime = (Date.now() - encodingStart) / 1000;
+        console.log(`FFmpeg encoding completed in ${encodingTime.toFixed(1)}s`);
+      } catch (error) {
+        console.error(`FFmpeg encoding failed:`, error);
+        throw new Error(`Video encoding failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+
+      const deliveryProgress = FRAME_GENERATION_WEIGHT + ENCODING_WEIGHT;
+      setExportState({
+        status: "delivering",
+        format,
+        progress: deliveryProgress,
+        message: "Reading encoded file..."
+      });
       const data = await ffmpeg.readFile(outputName);
-      const byteData = data instanceof Uint8Array ? data : new Uint8Array(new TextEncoder().encode(data));
-      const blob = new Blob([byteData], { type: MIME_BY_FORMAT[format] });
+      console.log(`Read output file: ${outputName}, size: ${data instanceof Uint8Array ? data.length : 'unknown'} bytes`);
+
+      // Ensure we have proper binary data for MP4/MOV - create a new Uint8Array to avoid SharedArrayBuffer issues
+      const uint8Data = data instanceof Uint8Array ? new Uint8Array(data) : new Uint8Array(new TextEncoder().encode(data as string));
+      const blob = new Blob([uint8Data], { type: MIME_BY_FORMAT[format] });
+
+      console.log(`Created blob: size=${blob.size} bytes, type=${blob.type}`);
+
+      if (blob.size === 0) {
+        throw new Error(`Generated ${format} file is empty (0 bytes). Check console for encoding errors.`);
+      }
+
+      setExportState({
+        status: "delivering",
+        format,
+        progress: deliveryProgress + 0.03,
+        message: "Creating download..."
+      });
+
       const downloadUrl = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = downloadUrl;
@@ -842,7 +991,13 @@ export default function Home() {
         URL.revokeObjectURL(downloadUrl);
       }, 2000);
 
-      setExportState({ status: "done", format, progress: 1, message: `Exported ${OUTPUT_NAME[format]}` });
+      const totalTime = (Date.now() - startTime) / 1000;
+      setExportState({
+        status: "done",
+        format,
+        progress: 1,
+        message: `Exported ${OUTPUT_NAME[format]} • ${(blob.size / 1024).toFixed(1)}KB • ${totalTime.toFixed(1)}s`
+      });
       setTimeout(() => setExportState({ status: "idle", format: null, progress: 0 }), 2400);
       setStatus(`EXPORT> completed .${format}`);
     } catch (error) {
@@ -878,21 +1033,26 @@ export default function Home() {
       // Clean up all frame files
       const ffmpegInstance = ffmpegRef.current;
       if (ffmpegInstance) {
+        console.log(`Cleaning up ${totalFrames} frame files and output file`);
         try {
+          let cleanedFrames = 0;
           // Clean up all frame files that might have been created
           for (let i = 0; i < totalFrames; i++) {
             const frameName = `frame_${String(i).padStart(4, "0")}.png`;
             try {
               await ffmpegInstance.deleteFile(frameName);
+              cleanedFrames++;
             } catch {
               // file might not exist, continue
             }
           }
+          console.log(`Cleaned up ${cleanedFrames} frame files`);
 
           // Clean up output file if it exists
           if (outputName) {
             try {
               await ffmpegInstance.deleteFile(outputName);
+              console.log(`Cleaned up output file: ${outputName}`);
             } catch {
               // already removed or never created
             }
@@ -1022,7 +1182,7 @@ export default function Home() {
 
         <div className="grid gap-3">
           <section className="flex flex-col gap-1.5 border border-dim/60 p-2.5">
-            <span className="text-[10px] tracking-[0.18em] uppercase text-accent">Character Pixel Size</span>
+            <span className="text-[10px] tracking-[0.18em] uppercase text-accent">Character Size</span>
             <input
               type="range"
               min={charPixelLimits.min}
@@ -1034,9 +1194,9 @@ export default function Home() {
               style={{ accentColor: chosenScheme.accent }}
             />
             <div className="flex justify-between text-[10px] text-dim">
-              <span>{charPixelLimits.min} px</span>
-              <span>{charPixelSize}px</span>
-              <span>{charPixelLimits.max} px</span>
+              <span>Smaller</span>
+              <span>{charPixelSize}px export</span>
+              <span>Larger</span>
             </div>
           </section>
 
@@ -1114,10 +1274,10 @@ export default function Home() {
 
         <div className="mx-auto flex flex-col gap-3" style={metadataWidthStyle}>
           <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] uppercase tracking-[0.2em] text-dim">
-            <span>char {charPixelSize}px</span>
+            <span>export {charPixelSize}px</span>
+            <span>preview {previewFontSize}px</span>
             <span>grid {frameMetrics.width}x{frameMetrics.height}</span>
             <span>contrast {contrast.toFixed(2)}x</span>
-            <span>fps {PREVIEW_FPS}</span>
           </div>
           <div className="text-[9px] text-dim uppercase tracking-[0.18em]">{status}</div>
           <div className="text-[9px] text-dim uppercase tracking-[0.18em]">
