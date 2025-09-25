@@ -6,6 +6,9 @@ import clsx from "clsx";
 import { FFmpeg } from "@ffmpeg/ffmpeg";
 
 import { useAuth } from "@/contexts/auth-context";
+import { useIsMobile } from "@/hooks/useIsMobile";
+import { MobileControls } from "@/components/mobile-controls";
+import { MobilePreview } from "@/components/mobile-preview";
 
 const CHARACTER_PRESETS = [
   { label: "Dense Symbols", value: "dense", charset: "@#%$&8BWMX*oahkbdpqwmZO0QLCJUYXzcvunxrjft/\\|()1{}[]?-_+~<>i!lI;:,\"^`'. " },
@@ -299,6 +302,7 @@ export default function Home() {
   const asciiFrameRef = useRef<AsciiFrame | null>(null);
   const ffmpegRef = useRef<FFmpeg | null>(null);
   const { user, entitlement, signOut, loadingSession, loadingProfile } = useAuth();
+  const isMobile = useIsMobile();
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [charsetId, setCharsetId] = useState<CharsetId>(CHARACTER_PRESETS[0].value);
   const [charPixelSize, setCharPixelSize] = useState(6);
@@ -1064,6 +1068,118 @@ export default function Home() {
     }
   };
 
+  // Mobile UI
+  if (isMobile) {
+    return (
+      <div className="min-h-screen bg-background text-foreground">
+        {/* Mobile Header */}
+        <div className="flex items-center justify-between px-4 py-3 text-[10px] uppercase tracking-[0.2em] border-b border-dim/60">
+          <div className="text-accent">ascii.video</div>
+          <div className="flex items-center gap-2">
+            {isAuthLoading ? (
+              <span className="text-dim">syncing...</span>
+            ) : user ? (
+              <>
+                <span className="text-dim">{entitlement}</span>
+                {isFreeTier && (
+                  <button
+                    onClick={startCheckout}
+                    disabled={checkoutPending}
+                    className="text-accent hover:underline"
+                  >
+                    upgrade
+                  </button>
+                )}
+                <button
+                  onClick={handleSignOut}
+                  disabled={signOutPending}
+                  className="text-dim hover:text-accent"
+                >
+                  out
+                </button>
+              </>
+            ) : (
+              <>
+                <Link href="/login" className="text-accent">login</Link>
+                <Link href="/register" className="text-accent">register</Link>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* Mobile Main Content */}
+        <main className="bg-black/60 min-h-screen">
+          <MobilePreview
+            previewContent={previewContent}
+            chosenScheme={chosenScheme}
+            status={status}
+            isFreeTier={isFreeTier}
+            frameMetrics={frameMetrics}
+            contrast={contrast}
+            charPixelSize={charPixelSize}
+          />
+        </main>
+
+        {/* Mobile Controls */}
+        <MobileControls
+          charsetId={charsetId}
+          setCharsetId={setCharsetId}
+          characterPresets={CHARACTER_PRESETS}
+          charPixelSize={charPixelSize}
+          setCharPixelSize={setCharPixelSize}
+          charPixelLimits={charPixelLimits}
+          contrast={contrast}
+          setContrast={setContrast}
+          colorScheme={colorScheme}
+          setColorScheme={setColorScheme}
+          colorSchemes={COLOR_SCHEMES}
+          selectedFile={selectedFile}
+          onUploadClick={handleUploadClick}
+          exportFormats={EXPORT_FORMATS}
+          onExport={handleExport}
+          canExport={canExport}
+          isPlaying={isPlaying}
+          setIsPlaying={setIsPlaying}
+          chosenScheme={chosenScheme}
+          isLocked={!user}
+        />
+
+        {/* Hidden file input */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="video/mp4,video/quicktime,video/webm,video/x-msvideo"
+          className="hidden"
+          onChange={handleFileChange}
+        />
+
+        {/* Export progress modal for mobile */}
+        {exportState.status !== "idle" && (
+          <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
+            <div className="bg-black border border-accent p-6 w-full max-w-sm">
+              <div className="text-center">
+                <div className="text-accent text-lg mb-2">Exporting...</div>
+                <div className="text-dim text-sm mb-4">
+                  {exportState.message ?? `${exportState.status}...`}
+                </div>
+                <div className="w-full bg-dim/20 rounded-full h-2">
+                  <div
+                    className="bg-accent h-2 rounded-full transition-all duration-300"
+                    style={{ width: `${Math.round(exportState.progress * 100)}%` }}
+                  />
+                </div>
+                <div className="text-dim text-xs mt-2">
+                  {Math.round(exportState.progress * 100)}%
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Desktop UI (original layout)
   return (
     <div className="min-h-screen bg-background text-foreground">
       <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 text-[10px] uppercase tracking-[0.2em] sm:px-8">
